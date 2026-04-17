@@ -28,6 +28,8 @@ class MotorState:
     def __init__(self):
         self.q = None
         self.dq = None
+        # ===== XR_TELEOPERATE PATCH: tau_est observation for payload path =====
+        self.tau_est = np.nan
 
 class G1_29_LowState:
     def __init__(self):
@@ -59,7 +61,7 @@ class DataBuffer:
             self.data = data
 
 class G1_29_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False):
+    def __init__(self, motion_mode = False, simulation_mode = False, arm_tau_limit = None):
         logger_mp.info("Initialize G1_29_ArmController...")
         self.q_target = np.zeros(14)
         self.tauff_target = np.zeros(14)
@@ -75,10 +77,14 @@ class G1_29_ArmController:
         self.all_motor_q = None
         self.arm_velocity_limit = 20.0
         self.control_dt = 1.0 / 250.0
+        self.arm_tau_limit = None if arm_tau_limit is None else abs(float(arm_tau_limit))
 
         self._speed_gradual_max = False
         self._gradual_start_time = None
         self._gradual_time = None
+        self._tau_clip_warn_counter = 0
+        self._tau_est_field_logged = False
+        self._tau_est_missing_warned = False
 
         if self.motion_mode:
             self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Motion, hg_LowCmd)
@@ -136,16 +142,32 @@ class G1_29_ArmController:
         self.publish_thread.daemon = True
         self.publish_thread.start()
 
+        if self.arm_tau_limit is not None:
+            logger_mp.info(f"[G1_29_ArmController] arm tau clipping enabled: {self.arm_tau_limit}")
+
         logger_mp.info("Initialize G1_29_ArmController OK!")
 
+    # ===== XR_TELEOPERATE PATCH: subscribe tau_est into lowstate cache =====
     def _subscribe_motor_state(self):
         while True:
             msg = self.lowstate_subscriber.Read()
             if msg is not None:
                 lowstate = G1_29_LowState()
+                if not self._tau_est_field_logged:
+                    motor_state_attrs = [a for a in dir(msg.motor_state[0]) if not a.startswith('_')]
+                    logger_mp.info(f"[G1_29_ArmController] motor_state fields: {motor_state_attrs}")
+                    self._tau_est_field_logged = True
                 for id in range(G1_29_Num_Motors):
                     lowstate.motor_state[id].q  = msg.motor_state[id].q
                     lowstate.motor_state[id].dq = msg.motor_state[id].dq
+                    tau_est = getattr(msg.motor_state[id], "tau_est", None)
+                    if tau_est is None:
+                        lowstate.motor_state[id].tau_est = np.nan
+                        if not self._tau_est_missing_warned:
+                            logger_mp.warning("[G1_29_ArmController] tau_est field missing in motor_state; filling NaN.")
+                            self._tau_est_missing_warned = True
+                    else:
+                        lowstate.motor_state[id].tau_est = tau_est
                 self.lowstate_buffer.SetData(lowstate)
             time.sleep(0.002)
 
@@ -156,6 +178,24 @@ class G1_29_ArmController:
         cliped_arm_q_target = current_q + delta / max(motion_scale, 1.0)
         return cliped_arm_q_target
 
+    # ===== XR_TELEOPERATE PATCH: final arm tau hard-clip safety guard =====
+    def clip_arm_tau_target(self, target_tau):
+        if self.arm_tau_limit is None:
+            return target_tau
+
+        cliped_arm_tau_target = np.clip(target_tau, -self.arm_tau_limit, self.arm_tau_limit)
+        if np.any(np.abs(cliped_arm_tau_target - target_tau) > 1e-9):
+            self._tau_clip_warn_counter += 1
+            if self._tau_clip_warn_counter % 50 == 1:
+                logger_mp.warning(
+                    "[G1_29_ArmController] tau clipped: "
+                    f"limit={self.arm_tau_limit}, "
+                    f"raw_max={np.max(np.abs(target_tau)):.3f}, "
+                    f"clipped_max={np.max(np.abs(cliped_arm_tau_target)):.3f}"
+                )
+
+        return cliped_arm_tau_target
+
     def _ctrl_motor_state(self):
         if self.motion_mode:
             self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = 1.0;
@@ -164,18 +204,19 @@ class G1_29_ArmController:
             start_time = time.time()
 
             with self.ctrl_lock:
-                arm_q_target     = self.q_target
-                arm_tauff_target = self.tauff_target
+                arm_q_target     = self.q_target.copy()
+                arm_tauff_target = self.tauff_target.copy()
 
             if self.simulation_mode:
                 cliped_arm_q_target = arm_q_target
             else:
                 cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
+            cliped_arm_tauff_target = self.clip_arm_tau_target(arm_tauff_target)
 
             for idx, id in enumerate(G1_29_JointArmIndex):
                 self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
                 self.msg.motor_cmd[id].dq = 0
-                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]   
+                self.msg.motor_cmd[id].tau = cliped_arm_tauff_target[idx]
 
             self.msg.crc = self.crc.Crc(self.msg)
             self.lowcmd_publisher.Write(self.msg)
@@ -212,6 +253,11 @@ class G1_29_ArmController:
     def get_current_dual_arm_dq(self):
         '''Return current state dq of the left and right arm motors.'''
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_29_JointArmIndex])
+
+    # ===== XR_TELEOPERATE PATCH: tau_est getter for payload estimator =====
+    def get_current_dual_arm_tau_est(self):
+        '''Return current estimated tau of the left and right arm motors.'''
+        return np.array([self.lowstate_buffer.GetData().motor_state[id].tau_est for id in G1_29_JointArmIndex], dtype=float)
     
     def ctrl_dual_arm_go_home(self):
         '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''

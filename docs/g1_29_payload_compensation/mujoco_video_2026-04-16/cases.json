@@ -1,0 +1,55 @@
+{
+  "config": {
+    "side": "right",
+    "payload_mass": 0.8,
+    "payload_com": [
+      0.02,
+      0.0,
+      0.08
+    ],
+    "payload_scale": 1.0,
+    "arm_tau_limit": null,
+    "seed": 42,
+    "num_samples": 500,
+    "top_k": 3
+  },
+  "cases": [
+    {
+      "rank": 1,
+      "sample_index": 211,
+      "ee_pos_before_mm": 76.29452404932897,
+      "ee_pos_after_mm": 0.0,
+      "ee_ori_before_deg": 23.109148087942188,
+      "ee_ori_after_deg": 0.0,
+      "joint_rms_before_deg": 5.301374645965504,
+      "joint_rms_after_deg": 0.0,
+      "residual_tau_before_nm": 5.183551645162845,
+      "residual_tau_after_nm": 0.0
+    },
+    {
+      "rank": 2,
+      "sample_index": 296,
+      "ee_pos_before_mm": 73.6276424830095,
+      "ee_pos_after_mm": 0.0,
+      "ee_ori_before_deg": 22.372367659462856,
+      "ee_ori_after_deg": 0.0,
+      "joint_rms_before_deg": 5.1897047996320165,
+      "joint_rms_after_deg": 0.0,
+      "residual_tau_before_nm": 5.111271387531937,
+      "residual_tau_after_nm": 0.0
+    },
+    {
+      "rank": 3,
+      "sample_index": 388,
+      "ee_pos_before_mm": 72.60365069987381,
+      "ee_pos_after_mm": 0.0,
+      "ee_ori_before_deg": 22.201687378534068,
+      "ee_ori_after_deg": 0.0,
+      "joint_rms_before_deg": 5.169170691685567,
+      "joint_rms_after_deg": 0.0,
+      "residual_tau_before_nm": 5.09685524581098,
+      "residual_tau_after_nm": 0.0
+    }
+  ],
+  "video": "payload_compensation_mujoco.mp4"
+}

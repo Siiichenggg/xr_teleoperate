@@ -240,6 +240,66 @@ build  cert.pem  key.pem  LICENSE  pyproject.toml  README.md  rootCA.key  rootCA
 |  `--record`  | 【启用**数据录制**模式】<br />按 **r** 键进入遥操后，按 **s** 键可开启数据录制，再次按 **s** 键可结束录制并保存本次 episode 数据。<br />继续按下 **s** 键可重复前述过程。 |
 |  `--task-*`  | 此类参数可配置录制的文件保存路径，任务目标、描述、步骤等信息 |
 
+- `G1_29` payload / estimator 相关参数
+
+| ⚙️ 参数 | 📜 说明 |
+| :---: | :--- |
+| `--payload-enable` | 启用 `G1_29` 的 payload gravity compensation。 |
+| `--payload-side` | 指定 payload 挂载侧，支持 `left / right`。 |
+| `--payload-mass` | 手工设定的 payload 质量，单位 kg。 |
+| `--payload-com` | payload 在 active ee 坐标系下的质心偏移 `[x y z]`，单位 m。 |
+| `--payload-scale` | 对理论 payload torque 的缩放系数，便于保守调试。 |
+| `--payload-debug` / `--payload-log-every` | 输出 payload compensation 调试日志。 |
+| `--arm-tau-limit` | 对最终 arm feedforward torque 做硬限幅。 |
+| `--payload-est-enable` | 启用 `G1_29` payload estimator。 |
+| `--payload-est-debug` / `--payload-est-log-every` | 输出 estimator 周期日志，观察 `mass_hat` 的 `update / hold`。 |
+| `--payload-est-csv` / `--payload-est-csv-path` | 把 estimator 验证数据按周期写入 CSV。 |
+| `--payload-est-closed-loop` | 启用 `G1_29` estimator 的最小闭环写回，把 `mass_hat` 经门控和平滑后写回 payload compensation。 |
+| `--payload-est-closed-loop-alpha` | 闭环质量写回的低通系数。 |
+| `--payload-est-closed-loop-max-step` | 每个控制周期允许的最大质量变化，单位 kg。 |
+| `--payload-est-closed-loop-min-valid-updates` | 进入闭环 tracking 前要求的连续有效 estimator update 次数。 |
+
+对于 `G1_29`，现在支持三种逐步启用方式：
+
+1. 只开手工 payload compensation
+2. 打开 estimator 但不闭环，只做日志与 CSV 验证
+3. 打开 estimator 闭环，把 `mass_hat` 保守写回 payload compensation
+
+示例命令：
+
+```bash
+# 1) 只开手工 payload compensation
+python teleop_hand_and_arm.py \
+  --arm G1_29 \
+  --payload-enable \
+  --payload-side right \
+  --payload-mass 0.8 \
+  --payload-com 0.02 0.0 0.08
+
+# 2) 开 estimator 验证链（日志 + CSV，不闭环）
+python teleop_hand_and_arm.py \
+  --arm G1_29 \
+  --payload-enable \
+  --payload-side right \
+  --payload-mass 0.8 \
+  --payload-com 0.02 0.0 0.08 \
+  --payload-est-enable \
+  --payload-est-debug \
+  --payload-est-csv \
+  --payload-est-csv-path outputs/payload_est_log.csv
+
+# 3) 开 estimator 闭环
+python teleop_hand_and_arm.py \
+  --arm G1_29 \
+  --payload-enable \
+  --payload-side right \
+  --payload-mass 0.8 \
+  --payload-com 0.02 0.0 0.08 \
+  --payload-est-enable \
+  --payload-est-debug \
+  --payload-est-closed-loop
+```
+
 
 ## 1.4 🔄 状态转移图
 

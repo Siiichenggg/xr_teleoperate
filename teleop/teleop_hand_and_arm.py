@@ -1,5 +1,7 @@
 import time
 import argparse
+import csv
+import numpy as np
 from multiprocessing import Value, Array, Lock
 import threading
 import logging_mp
@@ -16,6 +18,7 @@ from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds
 from televuer import TeleVuerWrapper
 from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmController, H1_2_ArmController, H1_ArmController
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK
+from teleop.robot_control.payload_estimator import PayloadEstimatorG1_29
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
@@ -70,6 +73,118 @@ def get_state() -> dict:
         "RECORD_RUNNING": RECORD_RUNNING,
     }
 
+
+# ==================== XR_TELEOPERATE PATCH START ====================
+# Relative to upstream: the helper block below was added for the G1_29 payload
+# estimator validation chain and the conservative closed-loop mass writeback.
+# ===================== XR_TELEOPERATE PATCH END =====================
+PAYLOAD_EST_CSV_HEADER = [
+    "timestamp",
+    "loop_idx",
+    "arm",
+    "payload_side",
+    "mass_hat",
+    "mode",
+    "reason",
+    "dq_active_max",
+    "tau_nominal_max",
+    "tau_est_max",
+    "tau_residual_max",
+    "tau_unit_max",
+    "mass_raw",
+]
+
+
+def _append_payload_est_csv_row(csv_path: str, row: dict) -> None:
+    csv_dir = os.path.dirname(csv_path)
+    if csv_dir:
+        os.makedirs(csv_dir, exist_ok=True)
+
+    need_header = (not os.path.exists(csv_path)) or os.path.getsize(csv_path) == 0
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=PAYLOAD_EST_CSV_HEADER)
+        if need_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _format_payload_est_main_log(loop_idx: int, snapshot: dict, closed_loop: dict = None) -> str:
+    msg = (
+        "[payload_est_main] "
+        f"loop={loop_idx} "
+        f"side={snapshot['payload_side']} "
+        f"mass_hat={float(snapshot['mass_hat']):.5f} "
+        f"mode={snapshot['mode']} "
+        f"reason={snapshot['reason']} "
+        f"dq_max={float(snapshot['dq_active_max']):.5f} "
+        f"tau_nom_max={float(snapshot['tau_nominal_max']):.5f} "
+        f"tau_est_max={float(snapshot['tau_est_max']):.5f} "
+        f"tau_res_max={float(snapshot['tau_residual_max']):.5f} "
+        f"tau_unit_max={float(snapshot['tau_unit_max']):.5f} "
+        f"mass_raw={float(snapshot['mass_raw']):.5f}"
+    )
+    if closed_loop is not None:
+        msg += (
+            f" mass_cmd={float(closed_loop['mass_cmd']):.5f} "
+            f"mass_target={float(closed_loop['target_mass']):.5f} "
+            f"cl_active={bool(closed_loop['tracking_active'])} "
+            f"cl_reason={closed_loop['reason']} "
+            f"streak={int(closed_loop['valid_streak'])}"
+        )
+    return msg
+
+
+def _make_payload_closed_loop_state(initial_mass: float, alpha: float, max_step: float, min_valid_updates: int) -> dict:
+    return {
+        "enabled": True,
+        "mass_cmd": float(initial_mass),
+        "target_mass": float(initial_mass),
+        "alpha": float(np.clip(alpha, 0.0, 1.0)),
+        "max_step": max(0.0, float(max_step)),
+        "min_valid_updates": max(1, int(min_valid_updates)),
+        "valid_streak": 0,
+        "tracking_active": False,
+        "reason": "init",
+    }
+
+
+def _update_payload_closed_loop_state(state: dict, snapshot: dict, mass_min: float, mass_max: float) -> dict:
+    if snapshot is None:
+        state["tracking_active"] = False
+        state["reason"] = "freeze_no_snapshot"
+        return state
+
+    mass_hat = float(snapshot["mass_hat"])
+    is_ok_update = (
+        snapshot["mode"] == "update"
+        and snapshot["reason"] == "ok"
+        and bool(snapshot["is_valid"])
+        and np.isfinite(mass_hat)
+    )
+
+    if is_ok_update:
+        state["valid_streak"] += 1
+    else:
+        state["valid_streak"] = 0
+        state["tracking_active"] = False
+        state["reason"] = f"freeze_{snapshot['reason']}"
+        return state
+
+    if state["valid_streak"] < state["min_valid_updates"]:
+        state["tracking_active"] = False
+        state["reason"] = f"warmup_{state['valid_streak']}/{state['min_valid_updates']}"
+        return state
+
+    target_mass = float(np.clip(mass_hat, mass_min, mass_max))
+    filtered_target = (1.0 - state["alpha"]) * state["mass_cmd"] + state["alpha"] * target_mass
+    delta = float(np.clip(filtered_target - state["mass_cmd"], -state["max_step"], state["max_step"]))
+
+    state["target_mass"] = target_mass
+    state["mass_cmd"] = float(np.clip(state["mass_cmd"] + delta, mass_min, mass_max))
+    state["tracking_active"] = True
+    state["reason"] = "tracking"
+    return state
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
@@ -80,6 +195,25 @@ if __name__ == '__main__':
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], help='Select end effector controller')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
+    parser.add_argument('--payload-enable', action='store_true', help='Enable static payload gravity compensation for G1_29 arm')
+    parser.add_argument('--payload-side', type=str, choices=['left', 'right'], default='right', help='Active payload side for G1_29 payload compensation')
+    parser.add_argument('--payload-mass', type=float, default=0.0, help='Payload mass in kg for G1_29 payload compensation')
+    parser.add_argument('--payload-com', type=float, nargs=3, default=[0.0, 0.0, 0.0], metavar=('X', 'Y', 'Z'),
+                        help='Payload CoM offset in active ee frame [m] for G1_29 payload compensation')
+    parser.add_argument('--payload-scale', type=float, default=1.0, help='Scale applied to payload compensation torque for G1_29')
+    parser.add_argument('--payload-debug', action='store_true', help='Enable payload compensation debug logs for G1_29')
+    parser.add_argument('--payload-log-every', type=int, default=30, help='Log payload debug every N IK cycles for G1_29')
+    parser.add_argument('--arm-tau-limit', type=float, default=None, help='Hard clip total arm feedforward torque before DDS send for G1_29')
+    # ===== XR_TELEOPERATE PATCH: estimator / closed-loop CLI =====
+    parser.add_argument('--payload-est-enable', action='store_true', help='Enable G1_29 payload mass estimator logging')
+    parser.add_argument('--payload-est-debug', action='store_true', help='Enable G1_29 payload estimator debug logs')
+    parser.add_argument('--payload-est-log-every', type=int, default=30, help='Log payload estimator output every N control cycles')
+    parser.add_argument('--payload-est-csv', action='store_true', help='Write G1_29 payload estimator validation rows to CSV')
+    parser.add_argument('--payload-est-csv-path', type=str, default='outputs/payload_est_log.csv', help='CSV path for G1_29 payload estimator validation logs')
+    parser.add_argument('--payload-est-closed-loop', action='store_true', help='Enable G1_29 payload estimator closed-loop mass writeback')
+    parser.add_argument('--payload-est-closed-loop-alpha', type=float, default=0.15, help='Low-pass alpha for G1_29 payload estimator closed-loop mass writeback')
+    parser.add_argument('--payload-est-closed-loop-max-step', type=float, default=0.02, help='Maximum payload mass change [kg] per control cycle for G1_29 closed-loop mass writeback')
+    parser.add_argument('--payload-est-closed-loop-min-valid-updates', type=int, default=10, help='Number of consecutive valid estimator updates before enabling G1_29 closed-loop mass writeback')
     # mode flags
     parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
     parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
@@ -143,10 +277,64 @@ if __name__ == '__main__':
             status, result = motion_switcher.Enter_Debug_Mode()
             logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
 
+        # ===== XR_TELEOPERATE PATCH: estimator runtime / closed-loop state =====
+        payload_estimator = None
+        payload_est_log_every = max(1, int(args.payload_est_log_every))
+        payload_est_debug_enabled = bool(args.arm == "G1_29" and args.payload_est_enable and args.payload_est_debug)
+        payload_est_csv_enabled = bool(args.arm == "G1_29" and args.payload_est_enable and args.payload_est_csv)
+        payload_est_closed_loop_enabled = bool(args.arm == "G1_29" and args.payload_est_enable and args.payload_est_closed_loop)
+        payload_est_closed_loop_state = None
+        if args.payload_est_closed_loop and args.arm != "G1_29":
+            logger_mp.warning("[teleop_hand_and_arm] payload estimator closed-loop is only supported on G1_29; disabling it.")
+        if args.payload_est_closed_loop and not args.payload_est_enable:
+            logger_mp.warning("[teleop_hand_and_arm] payload estimator closed-loop requires --payload-est-enable; disabling closed-loop.")
         # arm
         if args.arm == "G1_29":
-            arm_ik = G1_29_ArmIK()
-            arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+            payload_enabled = bool(args.payload_enable or payload_est_closed_loop_enabled)
+            if payload_est_closed_loop_enabled and not args.payload_enable:
+                logger_mp.warning(
+                    "[teleop_hand_and_arm] enabling payload compensation because payload estimator closed-loop is requested."
+                )
+            payload_cfg = {
+                "enabled": payload_enabled,
+                "side": args.payload_side,
+                "mass": args.payload_mass,
+                "com_ee": np.array(args.payload_com, dtype=float),
+                "scale": args.payload_scale,
+                "debug": args.payload_debug,
+                "log_every": args.payload_log_every,
+            }
+            logger_mp.info(f"G1_29 payload_cfg: {payload_cfg}, arm_tau_limit={args.arm_tau_limit}")
+            arm_ik = G1_29_ArmIK(payload_cfg=payload_cfg)
+            arm_ctrl = G1_29_ArmController(
+                motion_mode=args.motion,
+                simulation_mode=args.sim,
+                arm_tau_limit=args.arm_tau_limit,
+            )
+            if args.payload_est_enable:
+                # ===== XR_TELEOPERATE PATCH: optional G1_29 payload estimator =====
+                payload_estimator = PayloadEstimatorG1_29(
+                    payload_side=args.payload_side,
+                    payload_com_ee=np.array(args.payload_com, dtype=float),
+                    debug=False,
+                    log_every=payload_est_log_every,
+                    mass_max=max(3.0, float(args.payload_mass)),
+                )
+                logger_mp.info("[teleop_hand_and_arm] G1_29 payload estimator enabled.")
+                if payload_est_closed_loop_enabled:
+                    # ===== XR_TELEOPERATE PATCH: closed-loop mass writeback state =====
+                    payload_est_closed_loop_state = _make_payload_closed_loop_state(
+                        initial_mass=float(payload_cfg["mass"]),
+                        alpha=args.payload_est_closed_loop_alpha,
+                        max_step=args.payload_est_closed_loop_max_step,
+                        min_valid_updates=args.payload_est_closed_loop_min_valid_updates,
+                    )
+                    logger_mp.info(
+                        "[teleop_hand_and_arm] G1_29 payload estimator closed-loop enabled: "
+                        f"alpha={payload_est_closed_loop_state['alpha']}, "
+                        f"max_step={payload_est_closed_loop_state['max_step']}, "
+                        f"min_valid_updates={payload_est_closed_loop_state['min_valid_updates']}"
+                    )
         elif args.arm == "G1_23":
             arm_ik = G1_23_ArmIK()
             arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
@@ -256,8 +444,10 @@ if __name__ == '__main__':
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
+        loop_idx = 0
         # main loop. robot start to follow VR user's motion
         while not STOP:
+            loop_idx += 1
             start_time = time.time()
             # get image
             if camera_config['head_camera']['enable_zmq']:
@@ -323,6 +513,29 @@ if __name__ == '__main__':
             # get current robot state data.
             current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
             current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
+            # ===== XR_TELEOPERATE PATCH: estimator observation assembly =====
+            current_lr_arm_tau_est = arm_ctrl.get_current_dual_arm_tau_est() if args.arm == "G1_29" else None
+            arm_obs = {
+                "q": current_lr_arm_q,
+                "dq": current_lr_arm_dq,
+                "tau_est": current_lr_arm_tau_est,
+            }
+            mass_hat = None
+            payload_est_snapshot = None
+            payload_est_closed_loop_snapshot = None
+            if payload_estimator is not None:
+                mass_hat = payload_estimator.update(arm_obs)
+                arm_obs["mass_hat"] = mass_hat
+                payload_est_snapshot = payload_estimator.get_debug_snapshot()
+                if payload_est_closed_loop_state is not None:
+                    # ===== XR_TELEOPERATE PATCH: gated closed-loop mass writeback =====
+                    payload_est_closed_loop_snapshot = _update_payload_closed_loop_state(
+                        payload_est_closed_loop_state,
+                        payload_est_snapshot,
+                        payload_estimator.mass_min,
+                        payload_estimator.mass_max,
+                    )
+                    arm_ik.payload_cfg["mass"] = float(payload_est_closed_loop_snapshot["mass_cmd"])
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
@@ -330,6 +543,57 @@ if __name__ == '__main__':
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+
+            # ===== XR_TELEOPERATE PATCH: estimator periodic log / CSV =====
+            if payload_est_snapshot is not None and loop_idx % payload_est_log_every == 0:
+                if payload_est_debug_enabled:
+                    logger_mp.info(
+                        _format_payload_est_main_log(
+                            loop_idx,
+                            payload_est_snapshot,
+                            closed_loop=payload_est_closed_loop_snapshot,
+                        )
+                    )
+                if payload_est_csv_enabled:
+                    csv_row = {
+                        "timestamp": f"{time.time():.6f}",
+                        "loop_idx": loop_idx,
+                        "arm": args.arm,
+                        "payload_side": payload_est_snapshot["payload_side"],
+                        "mass_hat": f"{float(payload_est_snapshot['mass_hat']):.6f}",
+                        "mode": payload_est_snapshot["mode"],
+                        "reason": payload_est_snapshot["reason"],
+                        "dq_active_max": f"{float(payload_est_snapshot['dq_active_max']):.6f}",
+                        "tau_nominal_max": f"{float(payload_est_snapshot['tau_nominal_max']):.6f}",
+                        "tau_est_max": f"{float(payload_est_snapshot['tau_est_max']):.6f}",
+                        "tau_residual_max": f"{float(payload_est_snapshot['tau_residual_max']):.6f}",
+                        "tau_unit_max": f"{float(payload_est_snapshot['tau_unit_max']):.6f}",
+                        "mass_raw": f"{float(payload_est_snapshot['mass_raw']):.6f}",
+                    }
+                    try:
+                        _append_payload_est_csv_row(args.payload_est_csv_path, csv_row)
+                    except Exception as e:
+                        logger_mp.warning(f"[payload_est_main] failed to append csv row to {args.payload_est_csv_path}: {e}")
+
+            payload_metrics = None
+            if args.arm == "G1_29":
+                payload_metrics = {
+                    "payload": arm_ik.get_last_payload_debug(),
+                }
+                if mass_hat is not None:
+                    payload_metrics["payload"]["mass_hat"] = float(mass_hat)
+                if payload_est_snapshot is not None:
+                    payload_metrics["payload"]["payload_estimator"] = payload_est_snapshot
+                if payload_est_closed_loop_snapshot is not None:
+                    # ===== XR_TELEOPERATE PATCH: closed-loop metrics recording =====
+                    payload_metrics["payload"]["payload_estimator_closed_loop"] = {
+                        "enabled": True,
+                        "tracking_active": bool(payload_est_closed_loop_snapshot["tracking_active"]),
+                        "reason": payload_est_closed_loop_snapshot["reason"],
+                        "valid_streak": int(payload_est_closed_loop_snapshot["valid_streak"]),
+                        "mass_cmd": float(payload_est_closed_loop_snapshot["mass_cmd"]),
+                        "target_mass": float(payload_est_closed_loop_snapshot["target_mass"]),
+                    }
 
             # record data
             if args.record:
@@ -419,13 +683,13 @@ if __name__ == '__main__':
                     states = {
                         "left_arm": {                                                                    
                             "qpos":   left_arm_state.tolist(),    # numpy.array -> list
-                            "qvel":   [],                          
-                            "torque": [],                        
+                            "qvel":   current_lr_arm_dq[:7].tolist(),
+                            "torque": [] if current_lr_arm_tau_est is None else current_lr_arm_tau_est[:7].tolist(),
                         }, 
                         "right_arm": {                                                                    
                             "qpos":   right_arm_state.tolist(),       
-                            "qvel":   [],                          
-                            "torque": [],                         
+                            "qvel":   current_lr_arm_dq[-7:].tolist(),
+                            "torque": [] if current_lr_arm_tau_est is None else current_lr_arm_tau_est[-7:].tolist(),
                         },                        
                         "left_ee": {                                                                    
                             "qpos":   left_ee_state,           
@@ -445,12 +709,12 @@ if __name__ == '__main__':
                         "left_arm": {                                   
                             "qpos":   left_arm_action.tolist(),       
                             "qvel":   [],       
-                            "torque": [],      
+                            "torque": sol_tauff[:7].tolist(),
                         }, 
                         "right_arm": {                                   
                             "qpos":   right_arm_action.tolist(),       
                             "qvel":   [],       
-                            "torque": [],       
+                            "torque": sol_tauff[-7:].tolist(),
                         },                         
                         "left_ee": {                                   
                             "qpos":   left_hand_action,       
@@ -468,9 +732,9 @@ if __name__ == '__main__':
                     }
                     if args.sim:
                         sim_state = sim_state_subscriber.read_data()            
-                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, sim_state=sim_state)
+                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, sim_state=sim_state, metrics=payload_metrics)
                     else:
-                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions)
+                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, metrics=payload_metrics)
 
             current_time = time.time()
             time_elapsed = current_time - start_time

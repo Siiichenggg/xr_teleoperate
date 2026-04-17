@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <title>G1_29 Payload Compensation Static Benchmark</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; color: #1c1c1c; background: #f7f8fa; }
+    .card { background: white; border-radius: 12px; padding: 18px; margin-bottom: 18px; box-shadow: 0 2px 10px rgba(0,0,0,0.06); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border: 1px solid #d7dbe2; padding: 10px 12px; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    th { background: #eef3f7; }
+    img { width: 100%; border-radius: 8px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    code { background: #eef3f7; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <section class="card">
+    <h1>G1_29 Payload Compensation Static Benchmark</h1>
+    <p>这是一个模型级静态 benchmark，用于近似量化 payload compensation 对静态持物偏差的改善幅度。</p>
+    <p>
+      <strong>side:</strong> <code>right</code> |
+      <strong>payload_mass:</strong> <code>0.8</code> kg |
+      <strong>payload_com_ee:</strong> <code>[0.02, 0.0, 0.08]</code> m |
+      <strong>samples:</strong> <code>500</code>
+    </p>
+  </section>
+  <section class="card">
+    <h2>Key Numbers</h2>
+    <table>
+      <thead><tr><th>Metric</th><th>Before</th><th>After</th><th>Improvement</th></tr></thead>
+      <tbody>
+<tr><td>Joint RMS (deg)</td><td>4.8353</td><td>0.0000</td><td>+100.00%</td></tr><tr><td>Joint P95 (deg)</td><td>9.9468</td><td>0.0000</td><td>+100.00%</td></tr><tr><td>Joint Max (deg)</td><td>11.2299</td><td>0.0000</td><td>+100.00%</td></tr><tr><td>EE Position RMS (mm)</td><td>44.2778</td><td>0.0000</td><td>+100.00%</td></tr><tr><td>EE Position P95 (mm)</td><td>65.4942</td><td>0.0000</td><td>+100.00%</td></tr><tr><td>EE Position Max (mm)</td><td>76.2945</td><td>0.0000</td><td>+100.00%</td></tr><tr><td>EE Orientation RMS (deg)</td><td>18.5644</td><td>0.0000</td><td>+100.00%</td></tr><tr><td>EE Orientation P95 (deg)</td><td>23.3320</td><td>0.0000</td><td>+100.00%</td></tr><tr><td>EE Orientation Max (deg)</td><td>25.3291</td><td>0.0000</td><td>+100.00%</td></tr><tr><td>Residual Tau RMS (Nm)</td><td>4.3963</td><td>0.0000</td><td>+100.00%</td></tr>
+      </tbody>
+    </table>
+  </section>
+<section class="card"><h2>summary_bars</h2><img src="summary_bars.png" alt="summary_bars"/></section><section class="card"><h2>error_histograms</h2><img src="error_histograms.png" alt="error_histograms"/></section><section class="card"><h2>workspace_error_scatter</h2><img src="workspace_error_scatter.png" alt="workspace_error_scatter"/></section><section class="card"><h2>representative_pose</h2><img src="representative_pose.png" alt="representative_pose"/></section><section class="card"><h2>joint_rms</h2><img src="joint_rms.png" alt="joint_rms"/></section>
+</body>
+</html>

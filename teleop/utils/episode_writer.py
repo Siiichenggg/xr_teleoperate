@@ -126,7 +126,7 @@ class EpisodeWriter():
         logger_mp.info(f"==> New episode created: {self.episode_dir}")
         return True  # Return True if the episode is successfully created
         
-    def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None, audios=None, sim_state=None):
+    def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None, audios=None, sim_state=None, metrics=None):
         # Increment the item ID
         self.item_id += 1
         # Create the item data dictionary
@@ -139,6 +139,7 @@ class EpisodeWriter():
             'tactiles': tactiles,
             'audios': audios,
             'sim_state': sim_state,
+            'metrics': metrics,
         }
         # Enqueue the item data
         self.item_data_queue.put(item_data)

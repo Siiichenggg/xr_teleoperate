@@ -42,6 +42,7 @@ class RerunEpisodeReader:
                     'actions': item_data.get('actions', {}),
                     'tactiles': item_data.get('tactiles', {}),
                     'audios': audios,
+                    'metrics': item_data.get('metrics', {}),
                 }
             )
 

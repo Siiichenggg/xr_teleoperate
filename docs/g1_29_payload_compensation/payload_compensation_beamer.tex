@@ -1,0 +1,333 @@
+% Compile with: xelatex payload_compensation_beamer.tex
+\documentclass[aspectratio=169,11pt]{ctexbeamer}
+
+\usetheme{Madrid}
+\usecolortheme{default}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+
+\usepackage{amsmath}
+\usepackage{bm}
+
+\title{G1\_29 Payload Gravity Compensation\\与在线质量估计结构说明}
+\author{xr\_teleoperate}
+\date{2026-04-16}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}{问题定位}
+  这次改动的重点不是“给手指单独做重力补偿”，而是：
+  \begin{itemize}
+    \item 把手里抓取物体的重量建模为末端执行器上的 payload 外载
+    \item 把 payload 引起的 ee 外力 / 外力矩映射成整条手臂的关节前馈力矩
+    \item 在此基础上补齐观测链，为未知质量估计预留结构
+  \end{itemize}
+
+  \vspace{0.4em}
+  当前控制链路：
+  \[
+  solve\_ik(\cdot)\rightarrow pin.rnea(\cdot)\rightarrow sol\_tauff
+  \rightarrow arm\ controller \rightarrow motor\_cmd[id].tau
+  \]
+\end{frame}
+
+\begin{frame}{总体改动分三阶段}
+  \textbf{阶段一：} 已知质量的静态 / 准静态 payload gravity compensation
+  \begin{itemize}
+    \item 只支持 \texttt{G1\_29}
+    \item 在 IK 前馈链中新增 \texttt{tau\_payload}
+    \item 输出改为 \texttt{sol\_tauff = tau\_nominal + tau\_payload}
+  \end{itemize}
+
+  \textbf{阶段二：} 补齐观测链
+  \begin{itemize}
+    \item low state 中新增 \texttt{tau\_est}
+    \item 主循环组装 \texttt{arm\_obs=\{q,dq,tau\_est\}}
+  \end{itemize}
+
+  \textbf{阶段三：} 新增 \texttt{PayloadEstimatorG1\_29}
+  \begin{itemize}
+    \item 在线输出 \texttt{mass\_hat}
+    \item 当前只打印 / 记录，尚未闭环写回补偿
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{为什么不是“给手指单独做重力补偿”}
+  payload 问题的主物理本质是：
+  \begin{itemize}
+    \item 末端抓着一个有质量的物体
+    \item 物体重力首先表现为 ee 上的外力 / 外力矩
+    \item ee 外载再沿 wrist / elbow / shoulder 传递为整条手臂的关节力矩需求
+  \end{itemize}
+
+  \vspace{0.4em}
+  因此补偿应落在 \textbf{arm torque feedforward}，而不是先改 hand controller。
+
+  \vspace{0.4em}
+  第一版也没有直接做 whole-body，原因是：
+  \begin{itemize}
+    \item 当前最稳定的入口是 dual-arm feedforward
+    \item whole-body 会引入 torso / waist / contact / base coupling
+    \item 会显著扩大建模和实机回归风险
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{阶段一：补偿挂点与参数入口}
+  主脚本新增 \texttt{G1\_29} 专用配置：
+  \begin{itemize}
+    \item \texttt{payload\_enable}, \texttt{payload\_side}
+    \item \texttt{payload\_mass}, \texttt{payload\_com}
+    \item \texttt{payload\_scale}
+    \item \texttt{payload\_debug}, \texttt{payload\_log\_every}
+    \item \texttt{arm\_tau\_limit}
+  \end{itemize}
+
+  \vspace{0.4em}
+  在 IK 层：
+  \[
+  \tau_{nominal}=rnea(q,\dot q,0)
+  \]
+  \[
+  \tau_{payload}=J^\top w_{payload}
+  \]
+  \[
+  sol\_tauff=\tau_{nominal}+\tau_{payload}
+  \]
+\end{frame}
+
+\begin{frame}{payload gravity compensation 原理}
+  payload 的质心 \texttt{payload\_com} 定义在 active side 的 \texttt{L\_ee / R\_ee} frame 下。
+
+  \vspace{0.4em}
+  在世界系中：
+  \[
+  f=
+  \begin{bmatrix}
+  0\\0\\-mg
+  \end{bmatrix}
+  \]
+  \[
+  m=r\times f
+  \]
+
+  于是 ee 上的 wrench 为：
+  \[
+  w_{payload}=
+  \begin{bmatrix}
+  m_x&m_y&m_z&f_x&f_y&f_z
+  \end{bmatrix}^{\top}
+  \]
+
+  实现采用 \texttt{LOCAL\_WORLD\_ALIGNED} Jacobian，并使用 Pinocchio wrench 顺序
+  \[
+  [m_x,m_y,m_z,f_x,f_y,f_z]
+  \]
+\end{frame}
+
+\begin{frame}{为什么 \texorpdfstring{$\tau_{payload}=J^\top w$}{tau=JTw}}
+  根据虚功关系：
+  \[
+  \delta W=w^\top \delta x=\tau^\top \delta q,\qquad \delta x=J\delta q
+  \]
+
+  所以有：
+  \[
+  \tau=J^\top w
+  \]
+
+  物理含义：
+  \begin{itemize}
+    \item payload 的重量不是停留在笛卡尔空间里的一个“末端力”
+    \item 它最终会转化为各个关节需要承担的附加支撑力矩
+    \item 所以补偿目标必须落到 joint torque space
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{active side 与安全护栏}
+  当前 \texttt{G1\_29} reduced model 为 14 维：
+  \begin{itemize}
+    \item 左臂：\texttt{0:7}
+    \item 右臂：\texttt{7:14}
+  \end{itemize}
+
+  第一版明确只对 active side 生效：
+  \begin{itemize}
+    \item 抓左手物体，只保留左臂补偿
+    \item 抓右手物体，只保留右臂补偿
+  \end{itemize}
+
+  \vspace{0.4em}
+  安全处理上：
+  \begin{itemize}
+    \item IK 层只负责输出理论 \texttt{sol\_tauff}
+    \item controller 层在真正写 \texttt{motor\_cmd[id].tau} 前做 \texttt{clip}
+  \end{itemize}
+
+  这样把“算法输出”和“安全护栏”明确分开。
+\end{frame}
+
+\begin{frame}{阶段二：为什么要补 \texttt{tau\_est}}
+  只有 \texttt{q/dq} 时，我们能知道：
+  \begin{itemize}
+    \item 当前姿态与速度
+    \item 名义模型 torque 应该是多少
+  \end{itemize}
+
+  但我们不知道：
+  \begin{itemize}
+    \item 电机实际承受了多少 torque
+    \item 模型预测与真实系统之间差了多少
+  \end{itemize}
+
+  \vspace{0.4em}
+  所以第二阶段补齐：
+  \[
+  \tau_{residual}=\tau_{est}-\tau_{nominal}
+  \]
+
+  未知质量估计依赖的核心信息，正是这个“模型未解释掉的力矩残差”。
+\end{frame}
+
+\begin{frame}{阶段三：\texttt{PayloadEstimatorG1\_29} 的定位}
+  当前估计器的设计范围：
+  \begin{itemize}
+    \item 只支持 \texttt{G1\_29}
+    \item 只估计单个标量 \texttt{mass\_hat}
+    \item 固定 \texttt{payload\_com}
+    \item 只做 active side 估计
+    \item 暂时不闭环写回补偿
+  \end{itemize}
+
+  \vspace{0.4em}
+  这意味着它当前更像一个“验证型估计器”：
+  \begin{itemize}
+    \item 验证残差是否真的反映 payload 质量
+    \item 验证现有观测条件下质量估计是否稳定
+    \item 为下一步闭环补偿提供基础
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{为什么第一版只估 \texttt{mass\_hat}}
+  若同时估计质量和质心：
+  \begin{itemize}
+    \item 参数维度更高
+    \item 质量与几何误差相互耦合
+    \item 可辨识性和稳定性都会明显变差
+  \end{itemize}
+
+  \vspace{0.4em}
+  因此第一版固定 \texttt{payload\_com}，只估一个标量质量：
+  \begin{itemize}
+    \item 先把几何假设固定
+    \item 先验证“质量这一维”是否能稳定识别
+    \item 后续再考虑扩展到 \texttt{com\_hat}
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{质量估计公式}
+  在估计器内部，使用静态 / 准静态近似：
+  \[
+  \tau_{nominal}=rnea(q,0,0)
+  \]
+
+  构造单位质量模板：
+  \[
+  \tau_{unit}(q)=J^\top w_{unit}
+  \]
+
+  其中：
+  \[
+  \tau_{residual}=\tau_{est}-\tau_{nominal}
+  \]
+  \[
+  \tau_{residual}\approx m\cdot \tau_{unit}
+  \]
+
+  对应的一维最小二乘闭式解为：
+  \[
+  m_{raw}=
+  \frac{\tau_{unit}^{\top}\tau_{residual}}
+  {\tau_{unit}^{\top}\tau_{unit}}
+  \]
+
+  本质上是在 joint torque space 中，把残差投影到“payload 重力方向模板”上。
+\end{frame}
+
+\begin{frame}{为什么需要门控、限幅与平滑}
+  实机中的 \texttt{tau\_est} 会混入噪声、摩擦和动态项，因此需要稳健性处理：
+  \begin{itemize}
+    \item \textbf{可观测性门控：} 防止 \(\tau_{unit}^{\top}\tau_{unit}\) 太小导致病态放大
+    \item \textbf{dq 低速门控：} 保证静态 / 准静态近似仍然成立
+    \item \textbf{合法性检查：} 过滤 NaN / inf / 缺失数据
+    \item \textbf{EMA 平滑：} 抑制单帧抖动
+    \item \textbf{限幅与 hold / fallback：} 保证输出在合理质量区间内，并在失效时保持稳定
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{当前方案的边界和局限}
+  \begin{itemize}
+    \item 只支持 \texttt{G1\_29}
+    \item 只支持单手 active side payload
+    \item 只适合静态 / 准静态 payload 场景
+    \item 还没有估计 \texttt{com\_hat}
+    \item 还没有引入 whole-body coupling
+    \item 估计器还没有闭环写回补偿链
+  \end{itemize}
+
+  \vspace{0.4em}
+  因而当前阶段的准确定位是：
+
+  \vspace{0.2em}
+  \textbf{先验证补偿链、观测链、估计链是否物理一致且工程可用，}
+
+  \textbf{再推进到真正的在线自适应 payload compensation。}
+\end{frame}
+
+\begin{frame}{参考仓库与论文}
+  \textbf{仓库内直接实现参考}
+  \begin{itemize}
+    \item \texttt{teleop/teleop\_hand\_and\_arm.py}
+    \item \texttt{teleop/robot\_control/robot\_arm\_ik.py}
+    \item \texttt{teleop/robot\_control/robot\_arm.py}
+    \item \texttt{teleop/robot\_control/payload\_estimator.py}
+  \end{itemize}
+
+  \textbf{外部参考}
+  \begin{itemize}
+    \item Pinocchio 官方仓库与文档：RNEA、frame Jacobian、ReferenceFrame 语义
+    \item Carpentier et al., \emph{The Pinocchio C++ library}, SII 2019
+    \item Roy Featherstone, \emph{Rigid Body Dynamics Algorithms}, Springer, 2008
+    \item Lynch \& Park, \emph{Modern Robotics}, Chapter 5: Velocity Kinematics and Statics
+  \end{itemize}
+
+  \vspace{0.4em}
+  这些资料支撑的是标准动力学 / 静力学原理；\\
+  而当前三阶段 payload 结构是面向本仓库约束做出的工程集成设计。
+\end{frame}
+
+\begin{frame}{总结}
+  这次工作的重点，不是单独“做了一个 estimator”，而是把 \texttt{G1\_29} 的 payload 能力从
+
+  \vspace{0.4em}
+  \textbf{已知质量的静态补偿}
+
+  \vspace{0.3em}
+  推进到
+
+  \vspace{0.3em}
+  \textbf{具备在线质量估计结构的工程化补偿框架}
+
+  \vspace{0.6em}
+  三个关键里程碑：
+  \begin{itemize}
+    \item 已知质量补偿链已接入
+    \item \texttt{tau\_est} 观测链已补齐
+    \item \texttt{mass\_hat} 在线估计模块已就位
+  \end{itemize}
+\end{frame}
+
+\end{document}

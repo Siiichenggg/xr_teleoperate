@@ -16,11 +16,13 @@ sys.path.append(parent2_dir)
 from teleop.utils.weighted_moving_filter import WeightedMovingFilter
 
 class G1_29_ArmIK:
-    def __init__(self, Unit_Test = False, Visualization = False):
+    def __init__(self, Unit_Test = False, Visualization = False, payload_cfg = None):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
 
         self.Unit_Test = Unit_Test
         self.Visualization = Visualization
+        self.payload_cfg = self._build_payload_cfg(payload_cfg)
+        self.payload_debug_counter = 0
 
         # fixed cache file path
         self.cache_path = "g1_29_model_cache.pkl"
@@ -116,6 +118,18 @@ class G1_29_ArmIK:
         # Get the hand joint ID and define the error function
         self.L_hand_id = self.reduced_robot.model.getFrameId("L_ee")
         self.R_hand_id = self.reduced_robot.model.getFrameId("R_ee")
+        self.last_tau_nominal = np.zeros(self.reduced_robot.model.nv)
+        self.last_tau_payload = np.zeros(self.reduced_robot.model.nv)
+        self.last_sol_tauff = np.zeros(self.reduced_robot.model.nv)
+        logger_mp.info(f"[G1_29_ArmIK] payload frame ids: L_ee={self.L_hand_id}, R_ee={self.R_hand_id}")
+        if self.payload_cfg["enabled"]:
+            logger_mp.info(
+                "[G1_29_ArmIK] payload compensation enabled: "
+                f"side={self.payload_cfg['side']}, "
+                f"mass={self.payload_cfg['mass']}, "
+                f"com_ee={self.payload_cfg['com_ee'].tolist()}, "
+                f"scale={self.payload_cfg['scale']}"
+            )
 
         self.translational_error = casadi.Function(
             "translational_error",
@@ -217,6 +231,114 @@ class G1_29_ArmIK:
                     )
                 )
 
+    # ===== XR_TELEOPERATE PATCH: G1_29 payload compensation config =====
+    def _build_payload_cfg(self, payload_cfg):
+        cfg = {
+            "enabled": False,
+            "side": "right",
+            "mass": 0.0,
+            "com_ee": np.zeros(3),
+            "scale": 1.0,
+            "debug": False,
+            "log_every": 30,
+        }
+        if payload_cfg is not None:
+            cfg.update(payload_cfg)
+
+        cfg["mass"] = float(cfg["mass"])
+        cfg["scale"] = float(cfg["scale"])
+        cfg["com_ee"] = np.asarray(cfg["com_ee"], dtype=float).reshape(3)
+        cfg["log_every"] = max(1, int(cfg["log_every"]))
+
+        if cfg["side"] not in ("left", "right"):
+            raise ValueError(f"Invalid payload side: {cfg['side']}")
+        if cfg["mass"] < 0.0:
+            raise ValueError(f"Payload mass must be non-negative, got {cfg['mass']}")
+        if cfg["scale"] < 0.0:
+            raise ValueError(f"Payload scale must be non-negative, got {cfg['scale']}")
+
+        return cfg
+
+    def _get_active_frame_id(self):
+        return self.L_hand_id if self.payload_cfg["side"] == "left" else self.R_hand_id
+
+    # ===== XR_TELEOPERATE PATCH: payload wrench -> joint torque =====
+    def _compute_payload_tau(self, q):
+        tau_payload = np.zeros(self.reduced_robot.model.nv)
+        if (not self.payload_cfg["enabled"]) or self.payload_cfg["mass"] <= 0.0 or self.payload_cfg["scale"] == 0.0:
+            return tau_payload
+
+        frame_id = self._get_active_frame_id()
+
+        pin.forwardKinematics(self.reduced_robot.model, self.reduced_robot.data, q)
+        pin.updateFramePlacements(self.reduced_robot.model, self.reduced_robot.data)
+        J = pin.computeFrameJacobian(
+            self.reduced_robot.model,
+            self.reduced_robot.data,
+            q,
+            frame_id,
+            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+        )
+
+        ee_rotation = self.reduced_robot.data.oMf[frame_id].rotation
+        com_world = ee_rotation @ self.payload_cfg["com_ee"]
+
+        force_world = np.array([0.0, 0.0, -9.81 * self.payload_cfg["mass"]])
+        moment_world = np.cross(com_world, force_world)
+
+        # Pinocchio spatial wrench ordering: [mx, my, mz, fx, fy, fz]
+        wrench = np.hstack([moment_world, force_world])
+        tau_payload = self.payload_cfg["scale"] * (J.T @ wrench)
+
+        # G1_29 reduced arm model is ordered as left(7) + right(7).
+        if self.payload_cfg["side"] == "left":
+            tau_payload[7:] = 0.0
+        else:
+            tau_payload[:7] = 0.0
+
+        return tau_payload
+
+    def _maybe_log_payload_debug(self, tau_nominal, tau_payload, sol_tauff):
+        if not self.payload_cfg["debug"]:
+            return
+
+        self.payload_debug_counter += 1
+        if self.payload_debug_counter % self.payload_cfg["log_every"] != 0:
+            return
+
+        if self.payload_cfg["side"] == "left":
+            active_tau = tau_payload[:7]
+            inactive_tau = tau_payload[7:]
+        else:
+            active_tau = tau_payload[7:]
+            inactive_tau = tau_payload[:7]
+
+        logger_mp.info(
+            "[payload] "
+            f"side={self.payload_cfg['side']} "
+            f"mass={self.payload_cfg['mass']:.3f} "
+            f"scale={self.payload_cfg['scale']:.3f} "
+            f"com={self.payload_cfg['com_ee'].tolist()} "
+            f"nominal_max={np.max(np.abs(tau_nominal)):.3f} "
+            f"payload_max={np.max(np.abs(tau_payload)):.3f} "
+            f"active_max={np.max(np.abs(active_tau)):.3f} "
+            f"inactive_max={np.max(np.abs(inactive_tau)):.6f} "
+            f"total_max={np.max(np.abs(sol_tauff)):.3f}"
+        )
+
+    # ===== XR_TELEOPERATE PATCH: expose payload debug snapshot =====
+    def get_last_payload_debug(self):
+        return {
+            "enabled": bool(self.payload_cfg["enabled"]),
+            "side": self.payload_cfg["side"],
+            "mass": float(self.payload_cfg["mass"]),
+            "scale": float(self.payload_cfg["scale"]),
+            "com_ee": self.payload_cfg["com_ee"].tolist(),
+            "tau_nominal": self.last_tau_nominal.tolist(),
+            "tau_payload": self.last_tau_payload.tolist(),
+            "sol_tauff": self.last_sol_tauff.tolist(),
+        }
+
     # Save both robot.model and reduced_robot.model
     def save_cache(self):
         data = {
@@ -279,7 +401,19 @@ class G1_29_ArmIK:
 
             self.init_data = sol_q
 
-            sol_tauff = pin.rnea(self.reduced_robot.model, self.reduced_robot.data, sol_q, v, np.zeros(self.reduced_robot.model.nv))
+            tau_nominal = pin.rnea(
+                self.reduced_robot.model,
+                self.reduced_robot.data,
+                sol_q,
+                v,
+                np.zeros(self.reduced_robot.model.nv),
+            )
+            tau_payload = self._compute_payload_tau(sol_q)
+            sol_tauff = tau_nominal + tau_payload
+            self.last_tau_nominal = np.asarray(tau_nominal, dtype=float).copy()
+            self.last_tau_payload = np.asarray(tau_payload, dtype=float).copy()
+            self.last_sol_tauff = np.asarray(sol_tauff, dtype=float).copy()
+            self._maybe_log_payload_debug(tau_nominal, tau_payload, sol_tauff)
 
             if self.Visualization:
                 self.vis.display(sol_q)  # for visualization
@@ -301,6 +435,9 @@ class G1_29_ArmIK:
             self.init_data = sol_q
 
             sol_tauff = pin.rnea(self.reduced_robot.model, self.reduced_robot.data, sol_q, v, np.zeros(self.reduced_robot.model.nv))
+            self.last_tau_nominal = np.zeros(self.reduced_robot.model.nv)
+            self.last_tau_payload = np.zeros(self.reduced_robot.model.nv)
+            self.last_sol_tauff = np.zeros(self.reduced_robot.model.nv)
 
             logger_mp.error(f"sol_q:{sol_q} \nmotorstate: \n{current_lr_arm_motor_q} \nleft_pose: \n{left_wrist} \nright_pose: \n{right_wrist}")
             if self.Visualization:
